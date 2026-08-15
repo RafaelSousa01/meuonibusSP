@@ -1,0 +1,1060 @@
+name: Build MeuOnibusSP APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create app source
+        shell: bash
+        run: |
+          mkdir -p "$(dirname 'App.xaml')"
+          cat > 'App.xaml' <<'EOF_FILE_1'
+          <?xml version="1.0" encoding="UTF-8" ?>
+          <Application
+              x:Class="MeuOnibusSP.App"
+              xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+              xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml">
+              <Application.Resources>
+                  <ResourceDictionary>
+                      <Color x:Key="Primary">#1565C0</Color>
+                      <Color x:Key="Surface">#FFFFFF</Color>
+                      <Color x:Key="Background">#F4F6F8</Color>
+                      <Color x:Key="TextPrimary">#111827</Color>
+                      <Color x:Key="TextSecondary">#6B7280</Color>
+                  </ResourceDictionary>
+              </Application.Resources>
+          </Application>
+          EOF_FILE_1
+
+          mkdir -p "$(dirname 'MeuOnibusSP.csproj')"
+          cat > 'MeuOnibusSP.csproj' <<'EOF_FILE_2'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFrameworks>net10.0-android</TargetFrameworks>
+              <OutputType>Exe</OutputType>
+              <RootNamespace>MeuOnibusSP</RootNamespace>
+              <UseMaui>true</UseMaui>
+              <SingleProject>true</SingleProject>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+
+              <ApplicationTitle>Meu Ônibus SP</ApplicationTitle>
+              <ApplicationId>com.rafael.meuonibussp</ApplicationId>
+              <ApplicationDisplayVersion>0.1.0</ApplicationDisplayVersion>
+              <ApplicationVersion>1</ApplicationVersion>
+              <SupportedOSPlatformVersion>23.0</SupportedOSPlatformVersion>
+            </PropertyGroup>
+          </Project>
+          EOF_FILE_2
+
+          mkdir -p "$(dirname 'MainPage.xaml.cs')"
+          cat > 'MainPage.xaml.cs' <<'EOF_FILE_3'
+          using System.Globalization;
+          using System.Text.Json;
+          using MeuOnibusSP.Models;
+          using MeuOnibusSP.Services;
+
+          namespace MeuOnibusSP;
+
+          public partial class MainPage : ContentPage
+          {
+              private readonly SpTransService _spTrans;
+              private readonly LocationService _locationService;
+              private readonly DistanceService _distanceService;
+
+              private Location? _currentLocation;
+              private BusLine? _selectedLine;
+              private BusStop? _nearestStop;
+
+              public MainPage(
+                  SpTransService spTrans,
+                  LocationService locationService,
+                  DistanceService distanceService)
+              {
+                  InitializeComponent();
+
+                  _spTrans = spTrans;
+                  _locationService = locationService;
+                  _distanceService = distanceService;
+              }
+
+              private async void OnSearchClicked(object? sender, EventArgs e)
+              {
+                  var search = SearchEntry.Text?.Trim();
+
+                  if (string.IsNullOrWhiteSpace(search))
+                  {
+                      await DisplayAlert("Busca", "Digite o número ou nome da linha.", "OK");
+                      return;
+                  }
+
+                  _spTrans.Token = TokenEntry.Text?.Trim() ?? string.Empty;
+
+                  await RunBusyAsync(async () =>
+                  {
+                      StatusLabel.Text = "Obtendo sua localização...";
+                      _currentLocation ??= await _locationService.GetCurrentLocationAsync();
+
+                      StatusLabel.Text = "Buscando linhas na SPTrans...";
+                      var lines = await _spTrans.SearchLinesAsync(search);
+
+                      LinesCollection.ItemsSource = lines;
+
+                      StatusLabel.Text = lines.Count == 0
+                          ? "Nenhuma linha encontrada."
+                          : $"Encontradas {lines.Count} opções. Escolha o sentido.";
+                  });
+              }
+
+              private async void OnLineSelected(
+                  object? sender,
+                  SelectionChangedEventArgs e)
+              {
+                  _selectedLine = e.CurrentSelection
+                      .OfType<BusLine>()
+                      .FirstOrDefault();
+
+                  if (_selectedLine is null)
+                      return;
+
+                  await RunBusyAsync(async () =>
+                  {
+                      _currentLocation ??= await _locationService.GetCurrentLocationAsync();
+
+                      StatusLabel.Text = "Localizando o ponto mais próximo dessa linha...";
+
+                      var stops = await _spTrans.GetStopsByLineAsync(_selectedLine.Code);
+
+                      _nearestStop = _distanceService.FindNearest(
+                          stops,
+                          _currentLocation);
+
+                      if (_nearestStop is null)
+                      {
+                          StatusLabel.Text = "Não encontrei paradas para essa linha.";
+                          return;
+                      }
+
+                      StopNameLabel.Text = _nearestStop.Name;
+                      StopAddressLabel.Text = _nearestStop.Address;
+                      DistanceLabel.Text = $"{_nearestStop.DistanceMeters:N0} m de você";
+                      NearestStopCard.IsVisible = true;
+
+                      StatusLabel.Text = "Consultando previsão e posições dos ônibus...";
+
+                      var arrivalsTask = _spTrans.GetArrivalsAsync(
+                          _nearestStop.Code,
+                          _selectedLine.Code);
+
+                      var vehiclesTask = _spTrans.GetVehiclesAsync(
+                          _selectedLine.Code);
+
+                      await Task.WhenAll(arrivalsTask, vehiclesTask);
+
+                      var arrivals = await arrivalsTask;
+                      var positions = await vehiclesTask;
+
+                      RenderArrivals(arrivals);
+                      await RenderMapAsync(positions.Vehicles);
+
+                      StatusLabel.Text =
+                          $"Linha {_selectedLine.DisplayCode} atualizada às {positions.ReferenceTime}.";
+                  });
+              }
+
+              private void RenderArrivals(ArrivalResponse response)
+              {
+                  var vehicles = response.Stop?
+                      .Lines
+                      .SelectMany(line => line.Vehicles)
+                      .Where(vehicle => !string.IsNullOrWhiteSpace(vehicle.ArrivalTime))
+                      .OrderBy(vehicle => vehicle.ArrivalTime)
+                      .ToList() ?? [];
+
+                  ArrivalsLabel.Text = vehicles.Count == 0
+                      ? "Sem previsão"
+                      : string.Join(" • ", vehicles.Take(3).Select(v => v.ArrivalTime));
+
+                  VehicleCountLabel.Text =
+                      vehicles.Count == 0
+                          ? "A SPTrans não retornou previsão para este ponto agora."
+                          : $"{vehicles.Count} veículo(s) com previsão para o ponto.";
+
+                  ArrivalsCard.IsVisible = true;
+              }
+
+              private async Task RenderMapAsync(IReadOnlyList<Vehicle> vehicles)
+              {
+                  if (_currentLocation is null || _nearestStop is null)
+                      return;
+
+                  var mapFile = await FileSystem.OpenAppPackageFileAsync("map.html");
+                  using var reader = new StreamReader(mapFile);
+                  var html = await reader.ReadToEndAsync();
+
+                  MapWebView.Source = new HtmlWebViewSource
+                  {
+                      Html = html
+                  };
+
+                  MapCard.IsVisible = true;
+
+                  await Task.Delay(700);
+
+                  var payload = new
+                  {
+                      user = new
+                      {
+                          lat = _currentLocation.Latitude,
+                          lon = _currentLocation.Longitude
+                      },
+                      stop = new
+                      {
+                          lat = _nearestStop.Latitude,
+                          lon = _nearestStop.Longitude,
+                          name = _nearestStop.Name
+                      },
+                      vehicles = vehicles.Select(v => new
+                      {
+                          lat = v.Latitude,
+                          lon = v.Longitude,
+                          prefix = v.Prefix
+                      })
+                  };
+
+                  var json = JsonSerializer.Serialize(payload);
+
+                  await MapWebView.EvaluateJavaScriptAsync(
+                      $"renderBusMap({json});");
+              }
+
+              private async Task RunBusyAsync(Func<Task> action)
+              {
+                  try
+                  {
+                      LoadingIndicator.IsVisible = true;
+                      LoadingIndicator.IsRunning = true;
+
+                      await action();
+                  }
+                  catch (Exception ex)
+                  {
+                      StatusLabel.Text = "Ocorreu um erro.";
+                      await DisplayAlert("Erro", ex.Message, "OK");
+                  }
+                  finally
+                  {
+                      LoadingIndicator.IsRunning = false;
+                      LoadingIndicator.IsVisible = false;
+                  }
+              }
+          }
+          EOF_FILE_3
+
+          mkdir -p "$(dirname 'MainPage.xaml')"
+          cat > 'MainPage.xaml' <<'EOF_FILE_4'
+          <?xml version="1.0" encoding="utf-8" ?>
+          <ContentPage
+              x:Class="MeuOnibusSP.MainPage"
+              xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+              xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+              BackgroundColor="{StaticResource Background}"
+              Title="Meu Ônibus SP">
+
+              <Grid RowDefinitions="Auto,Auto,Auto,*" Padding="16" RowSpacing="12">
+
+                  <VerticalStackLayout Grid.Row="0" Spacing="4">
+                      <Label
+                          FontAttributes="Bold"
+                          FontSize="28"
+                          Text="Meu Ônibus SP"
+                          TextColor="{StaticResource TextPrimary}" />
+                      <Label
+                          FontSize="14"
+                          Text="Ônibus em tempo real usando SPTrans Olho Vivo"
+                          TextColor="{StaticResource TextSecondary}" />
+                  </VerticalStackLayout>
+
+                  <VerticalStackLayout Grid.Row="1" Spacing="8">
+                      <Entry
+                          x:Name="TokenEntry"
+                          IsPassword="True"
+                          Placeholder="Token da API Olho Vivo" />
+
+                      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                          <Entry
+                              x:Name="SearchEntry"
+                              Grid.Column="0"
+                              Placeholder="Ex.: 875A, 8000, Lapa"
+                              ReturnType="Search"
+                              Completed="OnSearchClicked" />
+
+                          <Button
+                              Grid.Column="1"
+                              Clicked="OnSearchClicked"
+                              Text="Buscar" />
+                      </Grid>
+                  </VerticalStackLayout>
+
+                  <ActivityIndicator
+                      x:Name="LoadingIndicator"
+                      Grid.Row="2"
+                      IsVisible="False"
+                      IsRunning="False" />
+
+                  <ScrollView Grid.Row="3">
+                      <VerticalStackLayout Spacing="12">
+
+                          <Label
+                              x:Name="StatusLabel"
+                              FontSize="14"
+                              Text="Informe seu token e pesquise uma linha."
+                              TextColor="{StaticResource TextSecondary}" />
+
+                          <CollectionView
+                              x:Name="LinesCollection"
+                              HeightRequest="220"
+                              SelectionMode="Single"
+                              SelectionChanged="OnLineSelected">
+                              <CollectionView.ItemTemplate>
+                                  <DataTemplate>
+                                      <Border
+                                          Margin="0,4"
+                                          Padding="12"
+                                          BackgroundColor="White"
+                                          Stroke="#E5E7EB">
+                                          <VerticalStackLayout>
+                                              <Label
+                                                  FontAttributes="Bold"
+                                                  FontSize="18"
+                                                  Text="{Binding DisplayCode}" />
+                                              <Label
+                                                  FontSize="13"
+                                                  Text="{Binding DirectionText}"
+                                                  TextColor="{StaticResource TextSecondary}" />
+                                          </VerticalStackLayout>
+                                      </Border>
+                                  </DataTemplate>
+                              </CollectionView.ItemTemplate>
+                          </CollectionView>
+
+                          <Border
+                              x:Name="NearestStopCard"
+                              IsVisible="False"
+                              Padding="14"
+                              BackgroundColor="White"
+                              Stroke="#E5E7EB">
+                              <VerticalStackLayout Spacing="5">
+                                  <Label
+                                      FontAttributes="Bold"
+                                      FontSize="13"
+                                      Text="PONTO MAIS PRÓXIMO"
+                                      TextColor="{StaticResource Primary}" />
+                                  <Label
+                                      x:Name="StopNameLabel"
+                                      FontAttributes="Bold"
+                                      FontSize="18" />
+                                  <Label
+                                      x:Name="StopAddressLabel"
+                                      FontSize="13"
+                                      TextColor="{StaticResource TextSecondary}" />
+                                  <Label
+                                      x:Name="DistanceLabel"
+                                      FontSize="15" />
+                              </VerticalStackLayout>
+                          </Border>
+
+                          <Border
+                              x:Name="ArrivalsCard"
+                              IsVisible="False"
+                              Padding="14"
+                              BackgroundColor="White"
+                              Stroke="#E5E7EB">
+                              <VerticalStackLayout Spacing="6">
+                                  <Label
+                                      FontAttributes="Bold"
+                                      FontSize="13"
+                                      Text="PRÓXIMOS ÔNIBUS"
+                                      TextColor="{StaticResource Primary}" />
+                                  <Label
+                                      x:Name="ArrivalsLabel"
+                                      FontAttributes="Bold"
+                                      FontSize="22"
+                                      Text="--" />
+                                  <Label
+                                      x:Name="VehicleCountLabel"
+                                      FontSize="13"
+                                      TextColor="{StaticResource TextSecondary}" />
+                              </VerticalStackLayout>
+                          </Border>
+
+                          <Border
+                              x:Name="MapCard"
+                              IsVisible="False"
+                              Padding="0"
+                              HeightRequest="380"
+                              BackgroundColor="White"
+                              Stroke="#E5E7EB">
+                              <WebView x:Name="MapWebView" />
+                          </Border>
+
+                      </VerticalStackLayout>
+                  </ScrollView>
+              </Grid>
+          </ContentPage>
+          EOF_FILE_4
+
+          mkdir -p "$(dirname 'App.xaml.cs')"
+          cat > 'App.xaml.cs' <<'EOF_FILE_5'
+          namespace MeuOnibusSP;
+
+          public partial class App : Application
+          {
+              public App(MainPage mainPage)
+              {
+                  InitializeComponent();
+                  MainPage = mainPage;
+              }
+          }
+          EOF_FILE_5
+
+          mkdir -p "$(dirname 'MauiProgram.cs')"
+          cat > 'MauiProgram.cs' <<'EOF_FILE_6'
+          using MeuOnibusSP.Services;
+
+          namespace MeuOnibusSP;
+
+          public static class MauiProgram
+          {
+              public static MauiApp CreateMauiApp()
+              {
+                  var builder = MauiApp.CreateBuilder();
+
+                  builder.UseMauiApp<App>();
+
+                  builder.Services.AddSingleton(new HttpClientHandler
+                  {
+                      UseCookies = true,
+                      CookieContainer = new System.Net.CookieContainer()
+                  });
+
+                  builder.Services.AddSingleton(sp =>
+                  {
+                      var handler = sp.GetRequiredService<HttpClientHandler>();
+                      return new HttpClient(handler)
+                      {
+                          BaseAddress = new Uri("http://api.olhovivo.sptrans.com.br/v2.1/"),
+                          Timeout = TimeSpan.FromSeconds(20)
+                      };
+                  });
+
+                  builder.Services.AddSingleton<SpTransService>();
+                  builder.Services.AddSingleton<LocationService>();
+                  builder.Services.AddSingleton<DistanceService>();
+
+                  builder.Services.AddSingleton<MainPage>();
+
+                  return builder.Build();
+              }
+          }
+          EOF_FILE_6
+
+          mkdir -p "$(dirname 'Services/DistanceService.cs')"
+          cat > 'Services/DistanceService.cs' <<'EOF_FILE_7'
+          using MeuOnibusSP.Models;
+
+          namespace MeuOnibusSP.Services;
+
+          public sealed class DistanceService
+          {
+              public double CalculateMeters(
+                  double latitude1,
+                  double longitude1,
+                  double latitude2,
+                  double longitude2)
+              {
+                  const double earthRadiusMeters = 6371000;
+
+                  var lat1 = DegreesToRadians(latitude1);
+                  var lat2 = DegreesToRadians(latitude2);
+                  var deltaLat = DegreesToRadians(latitude2 - latitude1);
+                  var deltaLon = DegreesToRadians(longitude2 - longitude1);
+
+                  var a =
+                      Math.Sin(deltaLat / 2) * Math.Sin(deltaLat / 2) +
+                      Math.Cos(lat1) * Math.Cos(lat2) *
+                      Math.Sin(deltaLon / 2) * Math.Sin(deltaLon / 2);
+
+                  var c = 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
+
+                  return earthRadiusMeters * c;
+              }
+
+              public BusStop? FindNearest(
+                  IEnumerable<BusStop> stops,
+                  Location currentLocation)
+              {
+                  BusStop? nearest = null;
+                  var shortest = double.MaxValue;
+
+                  foreach (var stop in stops)
+                  {
+                      var distance = CalculateMeters(
+                          currentLocation.Latitude,
+                          currentLocation.Longitude,
+                          stop.Latitude,
+                          stop.Longitude);
+
+                      stop.DistanceMeters = distance;
+
+                      if (distance < shortest)
+                      {
+                          shortest = distance;
+                          nearest = stop;
+                      }
+                  }
+
+                  return nearest;
+              }
+
+              private static double DegreesToRadians(double degrees) =>
+                  degrees * Math.PI / 180.0;
+          }
+          EOF_FILE_7
+
+          mkdir -p "$(dirname 'Services/SpTransService.cs')"
+          cat > 'Services/SpTransService.cs' <<'EOF_FILE_8'
+          using System.Net.Http.Json;
+          using System.Text.Json;
+          using MeuOnibusSP.Models;
+
+          namespace MeuOnibusSP.Services;
+
+          public sealed class SpTransService
+          {
+              private readonly HttpClient _httpClient;
+              private readonly SemaphoreSlim _authLock = new(1, 1);
+              private bool _authenticated;
+
+              public SpTransService(HttpClient httpClient)
+              {
+                  _httpClient = httpClient;
+              }
+
+              public string Token { get; set; } = string.Empty;
+
+              public async Task AuthenticateAsync(CancellationToken cancellationToken = default)
+              {
+                  if (_authenticated)
+                      return;
+
+                  if (string.IsNullOrWhiteSpace(Token))
+                      throw new InvalidOperationException(
+                          "Configure seu token da SPTrans antes de consultar.");
+
+                  await _authLock.WaitAsync(cancellationToken);
+
+                  try
+                  {
+                      if (_authenticated)
+                          return;
+
+                      var path = $"Login/Autenticar?token={Uri.EscapeDataString(Token)}";
+
+                      using var response = await _httpClient.PostAsync(
+                          path,
+                          content: null,
+                          cancellationToken);
+
+                      response.EnsureSuccessStatusCode();
+
+                      var authenticated = await response.Content
+                          .ReadFromJsonAsync<bool>(cancellationToken: cancellationToken);
+
+                      if (!authenticated)
+                          throw new InvalidOperationException("A SPTrans recusou o token informado.");
+
+                      _authenticated = true;
+                  }
+                  finally
+                  {
+                      _authLock.Release();
+                  }
+              }
+
+              public async Task<IReadOnlyList<BusLine>> SearchLinesAsync(
+                  string search,
+                  CancellationToken cancellationToken = default)
+              {
+                  await AuthenticateAsync(cancellationToken);
+
+                  var url = $"Linha/Buscar?termosBusca={Uri.EscapeDataString(search)}";
+
+                  var result = await _httpClient.GetFromJsonAsync<List<BusLine>>(
+                      url,
+                      cancellationToken);
+
+                  return result ?? [];
+              }
+
+              public async Task<IReadOnlyList<BusStop>> GetStopsByLineAsync(
+                  int lineCode,
+                  CancellationToken cancellationToken = default)
+              {
+                  await AuthenticateAsync(cancellationToken);
+
+                  var url = $"Parada/BuscarParadasPorLinha?codigoLinha={lineCode}";
+
+                  var result = await _httpClient.GetFromJsonAsync<List<BusStop>>(
+                      url,
+                      cancellationToken);
+
+                  return result ?? [];
+              }
+
+              public async Task<LinePositionResponse> GetVehiclesAsync(
+                  int lineCode,
+                  CancellationToken cancellationToken = default)
+              {
+                  await AuthenticateAsync(cancellationToken);
+
+                  var url = $"Posicao?codigoLinha={lineCode}";
+
+                  return await _httpClient.GetFromJsonAsync<LinePositionResponse>(
+                             url,
+                             cancellationToken)
+                         ?? new LinePositionResponse();
+              }
+
+              public async Task<ArrivalResponse> GetArrivalsAsync(
+                  int stopCode,
+                  int lineCode,
+                  CancellationToken cancellationToken = default)
+              {
+                  await AuthenticateAsync(cancellationToken);
+
+                  var url =
+                      $"Previsao?codigoParada={stopCode}&codigoLinha={lineCode}";
+
+                  return await _httpClient.GetFromJsonAsync<ArrivalResponse>(
+                             url,
+                             cancellationToken)
+                         ?? new ArrivalResponse();
+              }
+          }
+          EOF_FILE_8
+
+          mkdir -p "$(dirname 'Services/LocationService.cs')"
+          cat > 'Services/LocationService.cs' <<'EOF_FILE_9'
+          namespace MeuOnibusSP.Services;
+
+          public sealed class LocationService
+          {
+              public async Task<Location> GetCurrentLocationAsync(
+                  CancellationToken cancellationToken = default)
+              {
+                  var status = await Permissions.CheckStatusAsync<Permissions.LocationWhenInUse>();
+
+                  if (status != PermissionStatus.Granted)
+                      status = await Permissions.RequestAsync<Permissions.LocationWhenInUse>();
+
+                  if (status != PermissionStatus.Granted)
+                      throw new InvalidOperationException("Permissão de localização não concedida.");
+
+                  var request = new GeolocationRequest(
+                      GeolocationAccuracy.High,
+                      TimeSpan.FromSeconds(10));
+
+                  var location = await Geolocation.Default.GetLocationAsync(
+                      request,
+                      cancellationToken);
+
+                  return location ??
+                         throw new InvalidOperationException("Não foi possível obter sua localização.");
+              }
+          }
+          EOF_FILE_9
+
+          mkdir -p "$(dirname 'Models/LinePositionResponse.cs')"
+          cat > 'Models/LinePositionResponse.cs' <<'EOF_FILE_10'
+          using System.Text.Json.Serialization;
+
+          namespace MeuOnibusSP.Models;
+
+          public sealed class LinePositionResponse
+          {
+              [JsonPropertyName("hr")]
+              public string ReferenceTime { get; set; } = string.Empty;
+
+              [JsonPropertyName("vs")]
+              public List<Vehicle> Vehicles { get; set; } = [];
+          }
+          EOF_FILE_10
+
+          mkdir -p "$(dirname 'Models/ArrivalResponse.cs')"
+          cat > 'Models/ArrivalResponse.cs' <<'EOF_FILE_11'
+          using System.Text.Json.Serialization;
+
+          namespace MeuOnibusSP.Models;
+
+          public sealed class ArrivalResponse
+          {
+              [JsonPropertyName("hr")]
+              public string ReferenceTime { get; set; } = string.Empty;
+
+              [JsonPropertyName("p")]
+              public ArrivalStop? Stop { get; set; }
+          }
+
+          public sealed class ArrivalStop
+          {
+              [JsonPropertyName("cp")]
+              public int Code { get; set; }
+
+              [JsonPropertyName("np")]
+              public string Name { get; set; } = string.Empty;
+
+              [JsonPropertyName("py")]
+              public double Latitude { get; set; }
+
+              [JsonPropertyName("px")]
+              public double Longitude { get; set; }
+
+              [JsonPropertyName("l")]
+              public List<ArrivalLine> Lines { get; set; } = [];
+          }
+
+          public sealed class ArrivalLine
+          {
+              [JsonPropertyName("c")]
+              public string Sign { get; set; } = string.Empty;
+
+              [JsonPropertyName("cl")]
+              public int LineCode { get; set; }
+
+              [JsonPropertyName("sl")]
+              public int Direction { get; set; }
+
+              [JsonPropertyName("lt0")]
+              public string Destination { get; set; } = string.Empty;
+
+              [JsonPropertyName("lt1")]
+              public string Origin { get; set; } = string.Empty;
+
+              [JsonPropertyName("qv")]
+              public int VehicleCount { get; set; }
+
+              [JsonPropertyName("vs")]
+              public List<Vehicle> Vehicles { get; set; } = [];
+          }
+          EOF_FILE_11
+
+          mkdir -p "$(dirname 'Models/BusStop.cs')"
+          cat > 'Models/BusStop.cs' <<'EOF_FILE_12'
+          using System.Text.Json.Serialization;
+
+          namespace MeuOnibusSP.Models;
+
+          public sealed class BusStop
+          {
+              [JsonPropertyName("cp")]
+              public int Code { get; set; }
+
+              [JsonPropertyName("np")]
+              public string Name { get; set; } = string.Empty;
+
+              [JsonPropertyName("ed")]
+              public string Address { get; set; } = string.Empty;
+
+              [JsonPropertyName("py")]
+              public double Latitude { get; set; }
+
+              [JsonPropertyName("px")]
+              public double Longitude { get; set; }
+
+              [JsonIgnore]
+              public double DistanceMeters { get; set; }
+
+              public override string ToString() => $"{Name} • {DistanceMeters:N0} m";
+          }
+          EOF_FILE_12
+
+          mkdir -p "$(dirname 'Models/Vehicle.cs')"
+          cat > 'Models/Vehicle.cs' <<'EOF_FILE_13'
+          using System.Text.Json.Serialization;
+
+          namespace MeuOnibusSP.Models;
+
+          public sealed class Vehicle
+          {
+              [JsonPropertyName("p")]
+              public string Prefix { get; set; } = string.Empty;
+
+              [JsonPropertyName("a")]
+              public bool Accessible { get; set; }
+
+              [JsonPropertyName("ta")]
+              public DateTimeOffset? LastUpdate { get; set; }
+
+              [JsonPropertyName("py")]
+              public double Latitude { get; set; }
+
+              [JsonPropertyName("px")]
+              public double Longitude { get; set; }
+
+              [JsonPropertyName("t")]
+              public string? ArrivalTime { get; set; }
+          }
+          EOF_FILE_13
+
+          mkdir -p "$(dirname 'Models/BusLine.cs')"
+          cat > 'Models/BusLine.cs' <<'EOF_FILE_14'
+          using System.Text.Json.Serialization;
+
+          namespace MeuOnibusSP.Models;
+
+          public sealed class BusLine
+          {
+              [JsonPropertyName("cl")]
+              public int Code { get; set; }
+
+              [JsonPropertyName("lc")]
+              public bool IsCircular { get; set; }
+
+              [JsonPropertyName("lt")]
+              public string Sign { get; set; } = string.Empty;
+
+              [JsonPropertyName("sl")]
+              public int Direction { get; set; }
+
+              [JsonPropertyName("tl")]
+              public int Type { get; set; }
+
+              [JsonPropertyName("tp")]
+              public string MainTerminal { get; set; } = string.Empty;
+
+              [JsonPropertyName("ts")]
+              public string SecondaryTerminal { get; set; } = string.Empty;
+
+              [JsonIgnore]
+              public string DisplayCode => $"{Sign}-{Type}";
+
+              [JsonIgnore]
+              public string DirectionText =>
+                  Direction == 1
+                      ? $"{SecondaryTerminal} → {MainTerminal}"
+                      : $"{MainTerminal} → {SecondaryTerminal}";
+
+              public override string ToString() => $"{DisplayCode} • {DirectionText}";
+          }
+          EOF_FILE_14
+
+          mkdir -p "$(dirname 'Resources/Raw/map.html')"
+          cat > 'Resources/Raw/map.html' <<'EOF_FILE_15'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <meta charset="utf-8" />
+              <meta
+                  name="viewport"
+                  content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+
+              <link
+                  rel="stylesheet"
+                  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+              <style>
+                  html, body, #map {
+                      height: 100%;
+                      margin: 0;
+                      padding: 0;
+                  }
+
+                  .bus-marker {
+                      background: #1565C0;
+                      border: 2px solid white;
+                      border-radius: 50%;
+                      width: 28px;
+                      height: 28px;
+                      line-height: 24px;
+                      text-align: center;
+                      box-shadow: 0 1px 5px rgba(0,0,0,.35);
+                  }
+              </style>
+          </head>
+          <body>
+          <div id="map"></div>
+
+          <script
+              src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js">
+          </script>
+
+          <script>
+              const map = L.map('map').setView([-23.5505, -46.6333], 13);
+
+              L.tileLayer(
+                  'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  {
+                      maxZoom: 19,
+                      attribution: '&copy; OpenStreetMap contributors'
+                  }
+              ).addTo(map);
+
+              const layers = L.layerGroup().addTo(map);
+
+              function renderBusMap(data) {
+                  layers.clearLayers();
+
+                  const bounds = [];
+
+                  const user = L.marker(
+                      [data.user.lat, data.user.lon],
+                      { title: 'Você' }
+                  )
+                  .bindPopup('Você está aqui')
+                  .addTo(layers);
+
+                  bounds.push([data.user.lat, data.user.lon]);
+
+                  const stop = L.marker(
+                      [data.stop.lat, data.stop.lon],
+                      { title: data.stop.name }
+                  )
+                  .bindPopup('🚏 ' + data.stop.name)
+                  .addTo(layers);
+
+                  bounds.push([data.stop.lat, data.stop.lon]);
+
+                  data.vehicles.forEach(v => {
+                      const icon = L.divIcon({
+                          html: '🚌',
+                          className: 'bus-marker',
+                          iconSize: [28, 28]
+                      });
+
+                      L.marker(
+                          [v.lat, v.lon],
+                          { icon: icon }
+                      )
+                      .bindPopup('Ônibus ' + v.prefix)
+                      .addTo(layers);
+
+                      bounds.push([v.lat, v.lon]);
+                  });
+
+                  if (bounds.length > 1) {
+                      map.fitBounds(bounds, { padding: [30, 30] });
+                  } else {
+                      map.setView([data.user.lat, data.user.lon], 15);
+                  }
+
+                  setTimeout(() => map.invalidateSize(), 200);
+              }
+          </script>
+          </body>
+          </html>
+          EOF_FILE_15
+
+          mkdir -p "$(dirname 'Platforms/Android/AndroidManifest.xml')"
+          cat > 'Platforms/Android/AndroidManifest.xml' <<'EOF_FILE_16'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+              <uses-feature
+                  android:name="android.hardware.location"
+                  android:required="false" />
+              <uses-feature
+                  android:name="android.hardware.location.gps"
+                  android:required="false" />
+              <uses-feature
+                  android:name="android.hardware.location.network"
+                  android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="true">
+              </application>
+
+          </manifest>
+          EOF_FILE_16
+
+          mkdir -p "$(dirname 'Platforms/Android/MainActivity.cs')"
+          cat > 'Platforms/Android/MainActivity.cs' <<'EOF_FILE_17'
+          using Android.App;
+          using Android.Content.PM;
+          using Android.OS;
+
+          namespace MeuOnibusSP;
+
+          [Activity(
+              Theme = "@style/Maui.SplashTheme",
+              MainLauncher = true,
+              LaunchMode = LaunchMode.SingleTop,
+              ConfigurationChanges =
+                  ConfigChanges.ScreenSize |
+                  ConfigChanges.Orientation |
+                  ConfigChanges.UiMode |
+                  ConfigChanges.ScreenLayout |
+                  ConfigChanges.SmallestScreenSize |
+                  ConfigChanges.Density)]
+          public class MainActivity : MauiAppCompatActivity
+          {
+          }
+          EOF_FILE_17
+
+          mkdir -p "$(dirname 'Platforms/Android/MainApplication.cs')"
+          cat > 'Platforms/Android/MainApplication.cs' <<'EOF_FILE_18'
+          using Android.App;
+          using Android.Runtime;
+
+          namespace MeuOnibusSP;
+
+          [Application]
+          public class MainApplication : MauiApplication
+          {
+              public MainApplication(IntPtr handle, JniHandleOwnership ownership)
+                  : base(handle, ownership)
+              {
+              }
+
+              protected override MauiApp CreateMauiApp() =>
+                  MauiProgram.CreateMauiApp();
+          }
+          EOF_FILE_18
+
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install MAUI Android workload
+        run: dotnet workload install maui-android
+
+      - name: Restore
+        run: dotnet restore MeuOnibusSP.csproj
+
+      - name: Publish APK
+        run: dotnet publish MeuOnibusSP.csproj -f net10.0-android -c Release -p:AndroidPackageFormat=apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeuOnibusSP-APK
+          path: |
+            bin/Release/net10.0-android/publish/*.apk
+            bin/Release/net10.0-android/*.apk
+          if-no-files-found: error
